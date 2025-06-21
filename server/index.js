@@ -363,6 +363,29 @@ app.get('/api/alerts', (req, res) => {
     }
 });
 
+// Active alerts endpoint (simplified response for alert monitor modal)
+app.get('/api/alerts/active', (req, res) => {
+    try {
+        const filters = {
+            severity: req.query.severity,
+            group: req.query.group,
+            node: req.query.node,
+            acknowledged: req.query.acknowledged === 'true' ? true : 
+                         req.query.acknowledged === 'false' ? false : undefined
+        };
+        
+        const activeAlerts = stateManager.alertManager.getActiveAlerts(filters);
+        
+        res.json({
+            success: true,
+            alerts: activeAlerts
+        });
+    } catch (error) {
+        console.error("Error in /api/alerts/active:", error);
+        res.status(500).json({ success: false, error: "Failed to fetch active alerts" });
+    }
+});
+
 // Alert history endpoint with pagination and filtering
 app.get('/api/alerts/history', (req, res) => {
     try {
@@ -495,6 +518,191 @@ app.post('/api/alerts/test-email', async (req, res) => {
     } catch (error) {
         console.error('[Test Email] Error sending test email:', error);
         res.status(500).json({ success: false, error: 'Internal server error while sending test email' });
+    }
+});
+
+// Test webhook endpoint
+app.post('/api/alerts/test-webhook', async (req, res) => {
+    try {
+        console.log('[Test Webhook] Sending test webhook...');
+        
+        // Get webhook URL from environment
+        const webhookUrl = process.env.WEBHOOK_URL;
+        
+        if (!webhookUrl) {
+            return res.status(400).json({ success: false, error: 'No webhook URL configured' });
+        }
+        
+        // Use the alert manager to send a test webhook
+        const testResult = await stateManager.alertManager.sendTestWebhook();
+        
+        if (testResult.success) {
+            console.log('[Test Webhook] Test webhook sent successfully');
+            res.json({ success: true, message: 'Test webhook sent successfully' });
+        } else {
+            console.error('[Test Webhook] Failed to send test webhook:', testResult.error);
+            res.status(400).json({ success: false, error: testResult.error || 'Failed to send test webhook' });
+        }
+    } catch (error) {
+        console.error('[Test Webhook] Error sending test webhook:', error);
+        res.status(500).json({ success: false, error: 'Internal server error while sending test webhook' });
+    }
+});
+
+// Test alert notifications
+app.post('/api/alerts/test', async (req, res) => {
+    try {
+        const { alertName, alertDescription, activeThresholds, notificationChannels, targetType, selectedVMs } = req.body;
+        
+        if (!alertName) {
+            return res.status(400).json({ success: false, error: 'Alert name is required' });
+        }
+        
+        if (!notificationChannels || notificationChannels.length === 0) {
+            return res.status(400).json({ success: false, error: 'At least one notification channel is required' });
+        }
+        
+        console.log('[Test Alert] Creating test alert notification...', { alertName, notificationChannels });
+        
+        // Transform thresholds to match AlertManager format
+        const transformedThresholds = (activeThresholds || []).map(threshold => ({
+            metric: threshold.type,
+            condition: 'greater_than_or_equal',
+            threshold: threshold.value
+        }));
+
+        // Create a test alert object with realistic data
+        const testAlert = {
+            id: `test_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            rule: {
+                id: 'test-rule',
+                name: alertName || 'Test Alert',
+                description: alertDescription || 'This is a test alert to verify notification configuration',
+                type: 'compound_threshold',
+                thresholds: transformedThresholds,
+                targetType: targetType || 'all',
+                selectedVMs: selectedVMs || '[]'
+            },
+            guest: {
+                name: 'pihole',
+                vmid: '103',
+                node: 'pimox',
+                type: 'lxc',
+                endpointId: 'primary'
+            },
+            severity: 'warning',
+            message: `Test notification for alert rule "${alertName}"`,
+            triggeredAt: Date.now(),
+            details: {
+                reason: 'Manual test triggered from dashboard',
+                timestamp: new Date().toISOString(),
+                notificationChannels: notificationChannels,
+                activeThresholds: transformedThresholds,
+                targetInfo: {
+                    type: targetType || 'all',
+                    selectedVMs: selectedVMs || '[]'
+                }
+            }
+        };
+        
+        const results = {};
+        
+        // Test each requested notification channel
+        for (const channel of notificationChannels) {
+            try {
+                switch (channel) {
+                        
+                    case 'email':
+                        if (!process.env.ALERT_TO_EMAIL || !process.env.SMTP_HOST) {
+                            results.email = { success: false, error: 'Email not configured' };
+                        } else {
+                            const emailResult = await stateManager.alertManager.sendTestAlertEmail({
+                                alertName: alertName,
+                                testAlert: testAlert,
+                                config: {
+                                    ALERT_TO_EMAIL: process.env.ALERT_TO_EMAIL,
+                                    ALERT_FROM_EMAIL: process.env.ALERT_FROM_EMAIL,
+                                    SMTP_HOST: process.env.SMTP_HOST,
+                                    SMTP_PORT: process.env.SMTP_PORT,
+                                    SMTP_USER: process.env.SMTP_USER,
+                                    SMTP_SECURE: process.env.SMTP_SECURE
+                                }
+                            });
+                            results.email = emailResult;
+                            
+                            // Update the test alert to show email was sent
+                            if (emailResult.success) {
+                                testAlert.emailSent = true;
+                            }
+                        }
+                        break;
+                        
+                    case 'webhook':
+                        if (!process.env.WEBHOOK_URL) {
+                            results.webhook = { success: false, error: 'Webhook URL not configured' };
+                        } else {
+                            // Use the existing test webhook functionality
+                            const axios = require('axios');
+                            const webhookPayload = {
+                                alert: testAlert,
+                                type: 'test',
+                                message: `Test notification: ${testAlert.message}`
+                            };
+                            
+                            try {
+                                await axios.post(process.env.WEBHOOK_URL, webhookPayload, {
+                                    timeout: 10000,
+                                    headers: { 'Content-Type': 'application/json' }
+                                });
+                                results.webhook = { success: true, message: 'Test webhook sent successfully' };
+                                testAlert.webhookSent = true;
+                            } catch (webhookError) {
+                                results.webhook = { success: false, error: webhookError.message };
+                            }
+                        }
+                        break;
+                        
+                    default:
+                        results[channel] = { success: false, error: `Unknown notification channel: ${channel}` };
+                }
+            } catch (channelError) {
+                results[channel] = { success: false, error: channelError.message };
+            }
+        }
+        
+        // Create dashboard alert if requested (after all other notifications are processed)
+        if (notificationChannels.includes('local')) {
+            try {
+                const alertManager = stateManager.alertManager;
+                alertManager.addTestAlert(testAlert);
+                
+                // Force save the alert with updated notification flags
+                alertManager.saveActiveAlerts();
+                
+                results.local = { success: true, message: 'Test alert added to dashboard' };
+            } catch (localError) {
+                results.local = { success: false, error: `Failed to add dashboard alert: ${localError.message}` };
+            }
+        }
+        
+        // Determine overall success
+        const hasSuccess = Object.values(results).some(r => r.success);
+        const hasFailure = Object.values(results).some(r => !r.success);
+        
+        const response = {
+            success: hasSuccess,
+            results: results,
+            message: hasSuccess ? 
+                (hasFailure ? 'Test completed with mixed results' : 'All test notifications sent successfully') :
+                'All test notifications failed'
+        };
+        
+        console.log('[Test Alert] Test completed successfully');
+        res.json(response);
+        
+    } catch (error) {
+        console.error('[Test Alert] Error sending test alert:', error);
+        res.status(500).json({ success: false, error: 'Internal server error while testing alert' });
     }
 });
 
@@ -722,6 +930,142 @@ app.get('/api/alerts/status', (req, res) => {
     } catch (error) {
         console.error("Error getting alert status:", error);
         res.status(500).json({ error: "Failed to get alert status" });
+    }
+});
+
+// Per-guest alert configuration endpoint
+app.post('/api/alerts/config', (req, res) => {
+    try {
+        const alertConfig = req.body;
+        
+        // Validate the alert configuration
+        if (!alertConfig || typeof alertConfig !== 'object') {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Invalid alert configuration' 
+            });
+        }
+        
+        // Create a rule from the per-guest configuration
+        const rule = {
+            id: 'per-guest-alerts',
+            name: 'Per-Guest Alert Thresholds',
+            description: 'Auto-generated rule from per-guest threshold configuration',
+            type: 'per_guest_thresholds',
+            globalThresholds: alertConfig.globalThresholds || {},
+            guestThresholds: alertConfig.guestThresholds || {},
+            enabled: alertConfig.enabled !== false,
+            notifications: alertConfig.notifications || {
+                dashboard: true,
+                email: false,
+                webhook: false
+            },
+            emailCooldowns: alertConfig.emailCooldowns || {},
+            webhookCooldowns: alertConfig.webhookCooldowns || {},
+            createdAt: alertConfig.lastUpdated || new Date().toISOString()
+        };
+        
+        // Check if the rule already exists
+        const existingRule = stateManager.alertManager.alertRules.get('per-guest-alerts');
+        
+        if (existingRule) {
+            // Update existing rule
+            const success = stateManager.alertManager.updateRule('per-guest-alerts', {
+                globalThresholds: rule.globalThresholds,
+                guestThresholds: rule.guestThresholds,
+                notifications: rule.notifications,
+                emailCooldowns: rule.emailCooldowns,
+                webhookCooldowns: rule.webhookCooldowns,
+                enabled: rule.enabled,
+                lastUpdated: new Date().toISOString()
+            });
+            
+            if (success) {
+                res.json({ 
+                    success: true, 
+                    message: 'Alert configuration updated successfully' 
+                });
+            } else {
+                res.status(500).json({ 
+                    success: false, 
+                    error: 'Failed to update alert configuration' 
+                });
+            }
+        } else {
+            // Create new rule
+            try {
+                const newRule = stateManager.alertManager.addRule(rule);
+                res.json({ 
+                    success: true, 
+                    message: 'Alert configuration created successfully',
+                    rule: newRule 
+                });
+            } catch (error) {
+                res.status(400).json({ 
+                    success: false, 
+                    error: error.message 
+                });
+            }
+        }
+        
+    } catch (error) {
+        console.error('Error saving alert configuration:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error while saving alert configuration' 
+        });
+    }
+});
+
+// Get per-guest alert configuration endpoint
+app.get('/api/alerts/config', (req, res) => {
+    try {
+        const existingRule = stateManager.alertManager.alertRules.get('per-guest-alerts');
+        
+        if (existingRule && existingRule.type === 'per_guest_thresholds') {
+            res.json({
+                success: true,
+                config: {
+                    type: 'per_guest_thresholds',
+                    globalThresholds: existingRule.globalThresholds || {},
+                    guestThresholds: existingRule.guestThresholds || {},
+                    notifications: existingRule.notifications || {
+                        dashboard: true,
+                        email: false,
+                        webhook: false
+                    },
+                    emailCooldowns: existingRule.emailCooldowns || {},
+                    webhookCooldowns: existingRule.webhookCooldowns || {},
+                    enabled: existingRule.enabled,
+                    lastUpdated: existingRule.lastUpdated || existingRule.createdAt
+                }
+            });
+        } else {
+            // Return empty config if no per-guest rule exists
+            res.json({
+                success: true,
+                config: {
+                    type: 'per_guest_thresholds',
+                    globalThresholds: {},
+                    guestThresholds: {},
+                    notifications: {
+                        dashboard: true,
+                        email: false,
+                        webhook: false
+                    },
+                    emailCooldowns: {},
+                    webhookCooldowns: {},
+                    enabled: true,
+                    lastUpdated: null
+                }
+            });
+        }
+    } catch (error) {
+        console.error('Error loading alert configuration:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error while loading alert configuration' 
+        });
     }
 });
 
@@ -1274,6 +1618,59 @@ app.post('/api/test-webhook', async (req, res) => {
     }
 });
 
+
+// Get webhook status and configuration
+app.get('/api/webhook-status', (req, res) => {
+    try {
+        const alertManager = stateManager.alertManager;
+        const webhookEnabled = process.env.GLOBAL_WEBHOOK_ENABLED === 'true';
+        const webhookUrl = process.env.WEBHOOK_URL;
+        
+        // Get cooldown information
+        const cooldownConfig = alertManager.webhookCooldownConfig;
+        const activeCooldowns = [];
+        
+        for (const [key, info] of alertManager.webhookCooldowns) {
+            if (info.cooldownUntil && info.cooldownUntil > Date.now()) {
+                activeCooldowns.push({
+                    key,
+                    cooldownUntil: new Date(info.cooldownUntil).toISOString(),
+                    remainingMinutes: Math.ceil((info.cooldownUntil - Date.now()) / 60000),
+                    lastSent: info.lastSent ? new Date(info.lastSent).toISOString() : null
+                });
+            }
+        }
+        
+        // Get recent webhook notifications
+        const recentWebhooks = [];
+        for (const [alertId, status] of alertManager.notificationStatus) {
+            if (status.webhookSent) {
+                recentWebhooks.push({
+                    alertId,
+                    sentAt: new Date(status.timestamp || Date.now()).toISOString(),
+                    channels: status.channels
+                });
+            }
+        }
+        
+        res.json({
+            enabled: webhookEnabled,
+            configured: !!webhookUrl,
+            url: webhookUrl ? webhookUrl.replace(/\/[^\/]+$/, '/***') : null, // Hide token part
+            cooldownConfig,
+            activeCooldowns,
+            recentWebhooks: recentWebhooks.slice(0, 10),
+            totalWebhooksSent: recentWebhooks.length
+        });
+    } catch (error) {
+        console.error('[WEBHOOK STATUS] Failed to get status:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // Global error handler for unhandled API errors
 app.use((err, req, res, next) => {
     console.error('Unhandled API error:', err);
@@ -1410,10 +1807,20 @@ let metricTimeoutId = null;
 // --- Update Cycle Logic --- 
 // Uses imported fetch functions and updates global state
 async function runDiscoveryCycle() {
-  if (isDiscoveryRunning) return;
+  if (isDiscoveryRunning) {
+    console.warn('[Discovery Cycle] Previous cycle still running, skipping this run');
+    return;
+  }
   isDiscoveryRunning = true;
   
   const startTime = Date.now();
+  const MAX_DISCOVERY_TIME = 120000; // 2 minutes max
+  
+  // Set a timeout to force completion if cycle takes too long
+  const timeoutHandle = setTimeout(() => {
+    console.error('[Discovery Cycle] Cycle exceeded maximum time, forcing completion');
+    isDiscoveryRunning = false;
+  }, MAX_DISCOVERY_TIME);
   let errors = [];
   
   try {
@@ -1458,13 +1865,17 @@ async function runDiscoveryCycle() {
       const duration = Date.now() - startTime;
       stateManager.updateDiscoveryData({ nodes: [], vms: [], containers: [], pbs: [] }, duration, errors);
   } finally {
+      clearTimeout(timeoutHandle);
       isDiscoveryRunning = false;
       scheduleNextDiscovery();
   }
 }
 
 async function runMetricCycle() {
-  if (isMetricsRunning) return;
+  if (isMetricsRunning) {
+    console.warn('[Metrics Cycle] Previous cycle still running, skipping this run');
+    return;
+  }
   if (io.engine.clientsCount === 0) {
     scheduleNextMetric(); 
     return;
@@ -1472,6 +1883,13 @@ async function runMetricCycle() {
   isMetricsRunning = true;
   
   const startTime = Date.now();
+  const MAX_METRICS_TIME = 30000; // 30 seconds max
+  
+  // Set a timeout to force completion if cycle takes too long
+  const timeoutHandle = setTimeout(() => {
+    console.error('[Metrics Cycle] Cycle exceeded maximum time, forcing completion');
+    isMetricsRunning = false;
+  }, MAX_METRICS_TIME);
   let errors = [];
   
   try {
@@ -1502,6 +1920,7 @@ async function runMetricCycle() {
                if (metricData && metricData.current) {
                    const guestId = `${metricData.endpointId}-${metricData.node}-${metricData.id}`;
                    metricsHistory.addMetricData(guestId, metricData.current);
+                   
                }
            });
            
@@ -1547,6 +1966,7 @@ async function runMetricCycle() {
       const duration = Date.now() - startTime;
       stateManager.updateMetricsData([], duration, errors);
   } finally {
+      clearTimeout(timeoutHandle);
       isMetricsRunning = false;
       scheduleNextMetric();
   }
